@@ -1,0 +1,18 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Build artifacts / logs
+build_log.txt
+*.bin
+*.elf
+*.map
+
+# Font generation cache (re-downloaded by scripts/gen_fonts.mjs)
+scripts/.fontcache/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
