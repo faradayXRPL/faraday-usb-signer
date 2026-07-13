@@ -186,6 +186,20 @@ void showReview(const txsigner::Review& review) {
 
     lv_obj_set_style_text_color(metaLbl, theme::Muted, 0);
 
+    for (uint8_t i = 0; i < review.fieldCount; ++i) {
+
+        char field[168];
+
+        snprintf(field, sizeof(field), "%s: %s", review.fields[i].name, review.fields[i].value);
+
+        lv_obj_t* fieldLbl = fine(p, field);
+
+        lv_obj_set_style_text_align(fieldLbl, LV_TEXT_ALIGN_LEFT, 0);
+
+        lv_obj_set_style_text_color(fieldLbl, theme::Silver, 0);
+
+    }
+
 
 
     lv_obj_t* warn = makeText(p, review.warning);
@@ -278,7 +292,7 @@ void submitUnsignedTxImpl(const char* payload) {
 
     g_pendingPayload[sizeof(g_pendingPayload) - 1] = '\0';
 
-    txsigner::Review review;
+    static txsigner::Review review;
 
     txsigner::parseAndReview(g_pendingPayload, &review);
 

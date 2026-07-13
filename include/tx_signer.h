@@ -4,11 +4,20 @@
 
 namespace txsigner {
 
+inline constexpr uint8_t MAX_REVIEW_FIELDS = 28;
+inline constexpr size_t REVIEW_FIELD_NAME_LEN = 28;
+inline constexpr size_t REVIEW_FIELD_VALUE_LEN = 128;
+
 enum class Status {
     Ready,
     Invalid,
     Unsupported,
     Signed,
+};
+
+struct ReviewField {
+    char name[REVIEW_FIELD_NAME_LEN] = "";
+    char value[REVIEW_FIELD_VALUE_LEN] = "";
 };
 
 struct Review {
@@ -28,6 +37,8 @@ struct Review {
     uint32_t destinationTag = 0;
     bool hasDestinationTag = false;
     bool highFee = false;
+    uint8_t fieldCount = 0;
+    ReviewField fields[MAX_REVIEW_FIELDS];
     char warning[80] = "";
 };
 

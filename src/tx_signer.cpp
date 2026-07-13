@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 
+#include <cstdarg>
 #include <cstring>
 
 #include "crypto_util.h"
@@ -19,6 +20,11 @@ constexpr uint8_t TXN_PREFIX[] = {0x54, 0x58, 0x4E, 0x00};
 // XRPL serialized-amount flags (8-byte amount field).
 constexpr uint64_t AMT_NOT_XRP = 0x8000000000000000ULL;
 constexpr uint64_t AMT_POSITIVE = 0x4000000000000000ULL;
+
+JsonDocument g_reviewedDoc;
+Review g_reviewedReview;
+uint8_t g_reviewedPayloadHash[32] = {};
+bool g_reviewedReady = false;
 
 struct Bytes {
     uint8_t data[2048];
@@ -269,7 +275,8 @@ void formatAmount(V v, char* out, size_t n) {
         snprintf(out, n, "%s drops", v.template as<const char*>());
     } else if (v.template is<JsonObjectConst>()) {
         JsonObjectConst o = v.template as<JsonObjectConst>();
-        snprintf(out, n, "%s %s", o["value"] | "?", o["currency"] | "?");
+        snprintf(out, n, "%s %s issuer %s", o["value"] | "?", o["currency"] | "?",
+                 o["issuer"] | "?");
     } else {
         snprintf(out, n, "-");
     }
@@ -280,7 +287,12 @@ template <typename V>
 void formatIssue(V v, char* out, size_t n) {
     if (v.template is<JsonObjectConst>()) {
         JsonObjectConst o = v.template as<JsonObjectConst>();
-        snprintf(out, n, "%s", o["currency"] | "?");
+        const char* currency = o["currency"] | "?";
+        if (strcmp(currency, "XRP") == 0) {
+            snprintf(out, n, "XRP");
+        } else {
+            snprintf(out, n, "%s issuer %s", currency, o["issuer"] | "?");
+        }
     } else {
         snprintf(out, n, "?");
     }
@@ -288,35 +300,45 @@ void formatIssue(V v, char* out, size_t n) {
 
 bool resolveSigner(JsonObject tx, uint8_t account[20], uint8_t pubkey[33]) {
     if (!wallet::accountIdFromAddress(tx["Account"] | "", account)) return false;
-    Bytes pub;
-    if (!appendHex(pub, wallet::publicKeyHex()) || pub.len != 33) return false;
-    memcpy(pubkey, pub.data, 33);
-    return true;
+    return hexToBytes(wallet::publicKeyHex(), pubkey, 33);
 }
+
+bool requireShown(const Review& review, const char* name);
 
 // Common trailing fields: SigningPubKey (7/3), optional TxnSignature (7/4),
 // Account (8/1). Callers append any AccountID field > Account afterwards.
-bool appendPubAndAccount(Bytes& b, const uint8_t pubkey[33], const uint8_t account[20],
-                         bool includeSig, const uint8_t* sig, size_t sigLen) {
+bool appendPubAndAccount(Bytes& b, const Review& review, const uint8_t pubkey[33],
+                         const uint8_t account[20], bool includeSig, const uint8_t* sig,
+                         size_t sigLen) {
+    if (!requireShown(review, "SigningPubKey")) return false;
     if (!append(b, 0x73) || !putVl(b, pubkey, 33)) return false;
     if (includeSig && (!append(b, 0x74) || !putVl(b, sig, sigLen))) return false;
+    if (!requireShown(review, "Account")) return false;
     if (!append(b, 0x81) || !putVl(b, account, 20)) return false;
     return true;
 }
 
 // Emit the leading UInt32 block shared by all types (canonical order:
 // Flags(2) < SourceTag(3) < Sequence(4)). LastLedger/type-specific fields follow.
-bool appendCommonUInts(Bytes& b, JsonObject tx) {
-    const uint32_t flags = readU32(tx["Flags"]);
-    const uint32_t sourceTag = readU32(tx["SourceTag"]);
+bool appendCommonUInts(Bytes& b, JsonObject tx, const Review& review) {
+    if (tx["Flags"].is<uint32_t>()) {
+        if (!requireShown(review, "Flags")) return false;
+        const uint32_t flags = readU32(tx["Flags"]);
+        if (!append(b, 0x22) || !putU32(b, flags)) return false;
+    }
+    if (tx["SourceTag"].is<uint32_t>()) {
+        if (!requireShown(review, "SourceTag")) return false;
+        const uint32_t sourceTag = readU32(tx["SourceTag"]);
+        if (!append(b, 0x23) || !putU32(b, sourceTag)) return false;
+    }
+    if (!requireShown(review, "Sequence")) return false;
     const uint32_t sequence = readU32(tx["Sequence"]);
-    if (!append(b, 0x22) || !putU32(b, flags)) return false;
-    if (tx["SourceTag"].is<uint32_t>() && (!append(b, 0x23) || !putU32(b, sourceTag))) return false;
     if (!append(b, 0x24) || !putU32(b, sequence)) return false;
     return true;
 }
 
-bool appendPayment(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig, size_t sigLen) {
+bool appendPayment(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                   const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], destination[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     if (!wallet::accountIdFromAddress(tx["Destination"] | "", destination)) return false;
@@ -324,172 +346,233 @@ bool appendPayment(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig,
     const uint32_t destinationTag = readU32(tx["DestinationTag"]);
 
     // Canonical field order (ascending type code, then field code).
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 0)) return false;  // Payment
-    if (!appendCommonUInts(b, tx)) return false;
-    if (tx["DestinationTag"].is<uint32_t>() &&
-        (!append(b, 0x2E) || !putU32(b, destinationTag)))
-        return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (tx["DestinationTag"].is<uint32_t>()) {
+        if (!requireShown(review, "DestinationTag")) return false;
+        if (!append(b, 0x2E) || !putU32(b, destinationTag)) return false;
+    }
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;
+    if (!requireShown(review, "Amount")) return false;
     if (!append(b, 0x61) || !putAmountValue(b, tx["Amount"])) return false;  // Amount (6/1)
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;  // Fee (6/8)
-    if (!tx["SendMax"].isNull() &&
-        (!append(b, 0x69) || !putAmountValue(b, tx["SendMax"])))  // SendMax (6/9)
-        return false;
-    if (!tx["DeliverMin"].isNull() &&
-        (!append(b, 0x6A) || !putAmountValue(b, tx["DeliverMin"])))  // DeliverMin (6/10)
-        return false;
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!tx["SendMax"].isNull()) {
+        if (!requireShown(review, "SendMax")) return false;
+        if (!append(b, 0x69) || !putAmountValue(b, tx["SendMax"])) return false;  // SendMax
+    }
+    if (!tx["DeliverMin"].isNull()) {
+        if (!requireShown(review, "DeliverMin")) return false;
+        if (!append(b, 0x6A) || !putAmountValue(b, tx["DeliverMin"])) return false;
+    }
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!requireShown(review, "Destination")) return false;
     if (!append(b, 0x83) || !putVl(b, destination, 20)) return false;
-    if (tx["Paths"].is<JsonArray>() &&
-        (!append(b, 0x01) || !append(b, 0x12) || !putPathSet(b, tx["Paths"])))  // Paths (18/1)
-        return false;
+    if (tx["Paths"].is<JsonArray>()) {
+        if (!requireShown(review, "Paths")) return false;
+        if (!append(b, 0x01) || !append(b, 0x12) || !putPathSet(b, tx["Paths"])) return false;
+    }
     return true;
 }
 
-bool appendTrustSet(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig, size_t sigLen) {
+bool appendTrustSet(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                    const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     JsonObject limit = tx["LimitAmount"].as<JsonObject>();
     const uint32_t lastLedger = readU32(tx["LastLedgerSequence"]);
 
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 20)) return false;  // TrustSet
-    if (!appendCommonUInts(b, tx)) return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;
+    if (!requireShown(review, "LimitAmount")) return false;
     if (!append(b, 0x63) ||
         !putIouAmount(b, limit["currency"] | "", limit["issuer"] | "", limit["value"] | ""))
         return false;
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
     return true;
 }
 
-bool appendOfferCancel(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig,
-                       size_t sigLen) {
+bool appendOfferCancel(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                       const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     const uint32_t lastLedger = readU32(tx["LastLedgerSequence"]);
     const uint32_t offerSeq = readU32(tx["OfferSequence"]);
 
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 8)) return false;  // OfferCancel
-    if (!appendCommonUInts(b, tx)) return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (!requireShown(review, "OfferSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x19) || !putU32(b, offerSeq)) return false;  // OfferSequence(25)
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
     return true;
 }
 
-bool appendAccountSet(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig, size_t sigLen) {
+bool appendAccountSet(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                      const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     const uint32_t lastLedger = readU32(tx["LastLedgerSequence"]);
 
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 3)) return false;  // AccountSet
-    if (!appendCommonUInts(b, tx)) return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;
-    if (tx["SetFlag"].is<uint32_t>() &&
-        (!append(b, 0x20) || !append(b, 0x21) || !putU32(b, readU32(tx["SetFlag"]))))  // SetFlag(33)
-        return false;
-    if (tx["ClearFlag"].is<uint32_t>() &&
-        (!append(b, 0x20) || !append(b, 0x22) || !putU32(b, readU32(tx["ClearFlag"]))))  // ClearFlag(34)
-        return false;
+    if (tx["SetFlag"].is<uint32_t>()) {
+        if (!requireShown(review, "SetFlag")) return false;
+        if (!append(b, 0x20) || !append(b, 0x21) || !putU32(b, readU32(tx["SetFlag"])))
+            return false;
+    }
+    if (tx["ClearFlag"].is<uint32_t>()) {
+        if (!requireShown(review, "ClearFlag")) return false;
+        if (!append(b, 0x20) || !append(b, 0x22) || !putU32(b, readU32(tx["ClearFlag"])))
+            return false;
+    }
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
     return true;
 }
 
 // OfferCreate (DEX / meme-coin buy/sell, also market swaps via tfImmediateOrCancel
 // or tfFillOrKill). TakerPays = what you receive, TakerGets = what you give.
-bool appendOfferCreate(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig,
-                       size_t sigLen) {
+bool appendOfferCreate(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                       const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     const uint32_t lastLedger = readU32(tx["LastLedgerSequence"]);
 
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 7)) return false;  // OfferCreate
-    if (!appendCommonUInts(b, tx)) return false;
-    if (tx["Expiration"].is<uint32_t>() &&
-        (!append(b, 0x2A) || !putU32(b, readU32(tx["Expiration"]))))  // Expiration (2/10)
-        return false;
-    if (tx["OfferSequence"].is<uint32_t>() &&
-        (!append(b, 0x20) || !append(b, 0x19) || !putU32(b, readU32(tx["OfferSequence"]))))  // (2/25)
-        return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (tx["Expiration"].is<uint32_t>()) {
+        if (!requireShown(review, "Expiration")) return false;
+        if (!append(b, 0x2A) || !putU32(b, readU32(tx["Expiration"]))) return false;
+    }
+    if (tx["OfferSequence"].is<uint32_t>()) {
+        if (!requireShown(review, "OfferSequence")) return false;
+        if (!append(b, 0x20) || !append(b, 0x19) || !putU32(b, readU32(tx["OfferSequence"])))
+            return false;
+    }
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;  // LastLedger
+    if (!requireShown(review, "TakerPays")) return false;
     if (!append(b, 0x64) || !putAmountValue(b, tx["TakerPays"])) return false;  // TakerPays (6/4)
+    if (!requireShown(review, "TakerGets")) return false;
     if (!append(b, 0x65) || !putAmountValue(b, tx["TakerGets"])) return false;  // TakerGets (6/5)
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;     // Fee (6/8)
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
     return true;
 }
 
 // AMMDeposit (add liquidity). Asset/Asset2 identify the pool; the optional
 // Amount/Amount2/LPTokenOut/EPrice select the deposit mode.
-bool appendAmmDeposit(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig,
-                      size_t sigLen) {
+bool appendAmmDeposit(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                      const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     const uint32_t lastLedger = readU32(tx["LastLedgerSequence"]);
 
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 36)) return false;  // AMMDeposit
-    if (!appendCommonUInts(b, tx)) return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;
-    if (!tx["Amount"].isNull() &&
-        (!append(b, 0x61) || !putAmountValue(b, tx["Amount"])))  // Amount (6/1)
-        return false;
+    if (!tx["Amount"].isNull()) {
+        if (!requireShown(review, "Amount")) return false;
+        if (!append(b, 0x61) || !putAmountValue(b, tx["Amount"])) return false;
+    }
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;  // Fee (6/8)
-    if (!tx["Amount2"].isNull() &&
-        (!append(b, 0x6B) || !putAmountValue(b, tx["Amount2"])))  // Amount2 (6/11)
-        return false;
-    if (!tx["LPTokenOut"].isNull() &&
-        (!append(b, 0x60) || !append(b, 0x19) || !putAmountValue(b, tx["LPTokenOut"])))  // (6/25)
-        return false;
-    if (!tx["EPrice"].isNull() &&
-        (!append(b, 0x60) || !append(b, 0x1B) || !putAmountValue(b, tx["EPrice"])))  // (6/27)
-        return false;
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!tx["Amount2"].isNull()) {
+        if (!requireShown(review, "Amount2")) return false;
+        if (!append(b, 0x6B) || !putAmountValue(b, tx["Amount2"])) return false;
+    }
+    if (!tx["LPTokenOut"].isNull()) {
+        if (!requireShown(review, "LPTokenOut")) return false;
+        if (!append(b, 0x60) || !append(b, 0x19) || !putAmountValue(b, tx["LPTokenOut"]))
+            return false;
+    }
+    if (!tx["EPrice"].isNull()) {
+        if (!requireShown(review, "EPrice")) return false;
+        if (!append(b, 0x60) || !append(b, 0x1B) || !putAmountValue(b, tx["EPrice"]))
+            return false;
+    }
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!requireShown(review, "Asset")) return false;
     if (!append(b, 0x03) || !append(b, 0x18) || !putIssue(b, tx["Asset"])) return false;   // (24/3)
+    if (!requireShown(review, "Asset2")) return false;
     if (!append(b, 0x04) || !append(b, 0x18) || !putIssue(b, tx["Asset2"])) return false;  // (24/4)
     return true;
 }
 
 // AMMWithdraw (remove liquidity). Same shape as deposit but with LPTokenIn.
-bool appendAmmWithdraw(Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig,
-                       size_t sigLen) {
+bool appendAmmWithdraw(Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+                       const uint8_t* sig, size_t sigLen) {
     uint8_t account[20], pubkey[33];
     if (!resolveSigner(tx, account, pubkey)) return false;
     const uint32_t lastLedger = readU32(tx["LastLedgerSequence"]);
 
+    if (!requireShown(review, "TransactionType")) return false;
     if (!append(b, 0x12) || !putU16(b, 37)) return false;  // AMMWithdraw
-    if (!appendCommonUInts(b, tx)) return false;
+    if (!appendCommonUInts(b, tx, review)) return false;
+    if (!requireShown(review, "LastLedgerSequence")) return false;
     if (!append(b, 0x20) || !append(b, 0x1B) || !putU32(b, lastLedger)) return false;
-    if (!tx["Amount"].isNull() &&
-        (!append(b, 0x61) || !putAmountValue(b, tx["Amount"])))  // Amount (6/1)
-        return false;
+    if (!tx["Amount"].isNull()) {
+        if (!requireShown(review, "Amount")) return false;
+        if (!append(b, 0x61) || !putAmountValue(b, tx["Amount"])) return false;
+    }
+    if (!requireShown(review, "Fee")) return false;
     if (!append(b, 0x68) || !putXrpAmount(b, tx["Fee"] | "")) return false;  // Fee (6/8)
-    if (!tx["Amount2"].isNull() &&
-        (!append(b, 0x6B) || !putAmountValue(b, tx["Amount2"])))  // Amount2 (6/11)
-        return false;
-    if (!tx["LPTokenIn"].isNull() &&
-        (!append(b, 0x60) || !append(b, 0x1A) || !putAmountValue(b, tx["LPTokenIn"])))  // (6/26)
-        return false;
-    if (!tx["EPrice"].isNull() &&
-        (!append(b, 0x60) || !append(b, 0x1B) || !putAmountValue(b, tx["EPrice"])))  // (6/27)
-        return false;
-    if (!appendPubAndAccount(b, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!tx["Amount2"].isNull()) {
+        if (!requireShown(review, "Amount2")) return false;
+        if (!append(b, 0x6B) || !putAmountValue(b, tx["Amount2"])) return false;
+    }
+    if (!tx["LPTokenIn"].isNull()) {
+        if (!requireShown(review, "LPTokenIn")) return false;
+        if (!append(b, 0x60) || !append(b, 0x1A) || !putAmountValue(b, tx["LPTokenIn"]))
+            return false;
+    }
+    if (!tx["EPrice"].isNull()) {
+        if (!requireShown(review, "EPrice")) return false;
+        if (!append(b, 0x60) || !append(b, 0x1B) || !putAmountValue(b, tx["EPrice"]))
+            return false;
+    }
+    if (!appendPubAndAccount(b, review, pubkey, account, includeSig, sig, sigLen)) return false;
+    if (!requireShown(review, "Asset")) return false;
     if (!append(b, 0x03) || !append(b, 0x18) || !putIssue(b, tx["Asset"])) return false;   // (24/3)
+    if (!requireShown(review, "Asset2")) return false;
     if (!append(b, 0x04) || !append(b, 0x18) || !putIssue(b, tx["Asset2"])) return false;  // (24/4)
     return true;
 }
 
-bool serialize(const char* type, Bytes& b, JsonObject tx, bool includeSig, const uint8_t* sig,
-               size_t sigLen) {
-    if (strcmp(type, "Payment") == 0) return appendPayment(b, tx, includeSig, sig, sigLen);
-    if (strcmp(type, "TrustSet") == 0) return appendTrustSet(b, tx, includeSig, sig, sigLen);
-    if (strcmp(type, "OfferCreate") == 0) return appendOfferCreate(b, tx, includeSig, sig, sigLen);
-    if (strcmp(type, "OfferCancel") == 0) return appendOfferCancel(b, tx, includeSig, sig, sigLen);
-    if (strcmp(type, "AccountSet") == 0) return appendAccountSet(b, tx, includeSig, sig, sigLen);
-    if (strcmp(type, "AMMDeposit") == 0) return appendAmmDeposit(b, tx, includeSig, sig, sigLen);
-    if (strcmp(type, "AMMWithdraw") == 0) return appendAmmWithdraw(b, tx, includeSig, sig, sigLen);
+bool serialize(const char* type, Bytes& b, JsonObject tx, const Review& review, bool includeSig,
+               const uint8_t* sig, size_t sigLen) {
+    if (strcmp(type, "Payment") == 0) return appendPayment(b, tx, review, includeSig, sig, sigLen);
+    if (strcmp(type, "TrustSet") == 0) return appendTrustSet(b, tx, review, includeSig, sig, sigLen);
+    if (strcmp(type, "OfferCreate") == 0)
+        return appendOfferCreate(b, tx, review, includeSig, sig, sigLen);
+    if (strcmp(type, "OfferCancel") == 0)
+        return appendOfferCancel(b, tx, review, includeSig, sig, sigLen);
+    if (strcmp(type, "AccountSet") == 0)
+        return appendAccountSet(b, tx, review, includeSig, sig, sigLen);
+    if (strcmp(type, "AMMDeposit") == 0)
+        return appendAmmDeposit(b, tx, review, includeSig, sig, sigLen);
+    if (strcmp(type, "AMMWithdraw") == 0)
+        return appendAmmWithdraw(b, tx, review, includeSig, sig, sigLen);
     return false;
 }
 
@@ -501,6 +584,216 @@ JsonObject txObject(JsonDocument& doc) {
 void setReviewError(Review* review, Status status, const char* warning) {
     review->status = status;
     strncpy(review->warning, warning, sizeof(review->warning) - 1);
+}
+
+void clearReviewedCache() {
+    g_reviewedDoc.clear();
+    memset(&g_reviewedReview, 0, sizeof(g_reviewedReview));
+    memset(g_reviewedPayloadHash, 0, sizeof(g_reviewedPayloadHash));
+    g_reviewedReady = false;
+}
+
+bool addReviewField(Review* review, const char* name, const char* value) {
+    if (review->fieldCount >= MAX_REVIEW_FIELDS) {
+        setReviewError(review, Status::Invalid, "Too many review fields");
+        return false;
+    }
+    ReviewField& field = review->fields[review->fieldCount++];
+    strncpy(field.name, name, sizeof(field.name) - 1);
+    strncpy(field.value, value ? value : "", sizeof(field.value) - 1);
+    return true;
+}
+
+bool addReviewFieldFmt(Review* review, const char* name, const char* fmt, ...) {
+    char value[REVIEW_FIELD_VALUE_LEN];
+    va_list ap;
+    va_start(ap, fmt);
+    const int n = vsnprintf(value, sizeof(value), fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= static_cast<int>(sizeof(value))) {
+        setReviewError(review, Status::Invalid, "Review field too long");
+        return false;
+    }
+    return addReviewField(review, name, value);
+}
+
+bool reviewHasField(const Review& review, const char* name) {
+    for (uint8_t i = 0; i < review.fieldCount; ++i) {
+        if (strcmp(review.fields[i].name, name) == 0) return true;
+    }
+    return false;
+}
+
+bool requireShown(const Review& review, const char* name) {
+    return reviewHasField(review, name);
+}
+
+bool onlyAllowedNestedFields(JsonObjectConst obj, const char* const* allowed, size_t n,
+                             Review* review, const char* parent) {
+    for (JsonPairConst kv : obj) {
+        bool ok = false;
+        for (size_t i = 0; i < n; ++i) {
+            if (strcmp(kv.key().c_str(), allowed[i]) == 0) {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            char w[80];
+            snprintf(w, sizeof(w), "Field not allowed: %s.%s", parent, kv.key().c_str());
+            setReviewError(review, Status::Invalid, w);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validateXrpDrops(const char* drops, Review* review, const char* field) {
+    static Bytes probe;
+    probe.len = 0;
+    if (putXrpAmount(probe, drops)) return true;
+    char w[80];
+    snprintf(w, sizeof(w), "Invalid %s", field);
+    setReviewError(review, Status::Invalid, w);
+    return false;
+}
+
+bool validateAmountValue(JsonVariantConst v, Review* review, const char* field) {
+    if (v.is<const char*>()) return validateXrpDrops(v.as<const char*>(), review, field);
+    if (!v.is<JsonObjectConst>()) {
+        char w[80];
+        snprintf(w, sizeof(w), "Invalid %s", field);
+        setReviewError(review, Status::Invalid, w);
+        return false;
+    }
+    JsonObjectConst obj = v.as<JsonObjectConst>();
+    static const char* const allowed[] = {"currency", "issuer", "value"};
+    if (!onlyAllowedNestedFields(obj, allowed, sizeof(allowed) / sizeof(allowed[0]), review,
+                                 field)) {
+        return false;
+    }
+    if (!obj["currency"].is<const char*>() || !obj["issuer"].is<const char*>() ||
+        !obj["value"].is<const char*>()) {
+        char w[80];
+        snprintf(w, sizeof(w), "Invalid %s", field);
+        setReviewError(review, Status::Invalid, w);
+        return false;
+    }
+    static Bytes probe;
+    probe.len = 0;
+    if (putIouAmount(probe, obj["currency"] | "", obj["issuer"] | "", obj["value"] | "")) {
+        return true;
+    }
+    char w[80];
+    snprintf(w, sizeof(w), "Invalid %s", field);
+    setReviewError(review, Status::Invalid, w);
+    return false;
+}
+
+bool validateIssueValue(JsonVariantConst v, Review* review, const char* field) {
+    if (!v.is<JsonObjectConst>()) {
+        char w[80];
+        snprintf(w, sizeof(w), "Invalid %s", field);
+        setReviewError(review, Status::Invalid, w);
+        return false;
+    }
+    JsonObjectConst obj = v.as<JsonObjectConst>();
+    static const char* const allowed[] = {"currency", "issuer"};
+    if (!onlyAllowedNestedFields(obj, allowed, sizeof(allowed) / sizeof(allowed[0]), review,
+                                 field)) {
+        return false;
+    }
+    const char* currency = obj["currency"] | "";
+    if (!currency[0]) {
+        char w[80];
+        snprintf(w, sizeof(w), "Invalid %s", field);
+        setReviewError(review, Status::Invalid, w);
+        return false;
+    }
+    uint8_t probe[20];
+    if (strcmp(currency, "XRP") == 0) {
+        if (!obj["issuer"].isNull()) {
+            char w[80];
+            snprintf(w, sizeof(w), "Invalid %s issuer", field);
+            setReviewError(review, Status::Invalid, w);
+            return false;
+        }
+        return true;
+    }
+    if (!obj["issuer"].is<const char*>() || !fillCurrency(currency, probe) ||
+        !wallet::accountIdFromAddress(obj["issuer"] | "", probe)) {
+        char w[80];
+        snprintf(w, sizeof(w), "Invalid %s", field);
+        setReviewError(review, Status::Invalid, w);
+        return false;
+    }
+    return true;
+}
+
+bool validateOptionalU32(JsonObject tx, const char* field, Review* review) {
+    if (tx[field].isNull() || tx[field].is<uint32_t>()) return true;
+    char w[80];
+    snprintf(w, sizeof(w), "Invalid %s", field);
+    setReviewError(review, Status::Invalid, w);
+    return false;
+}
+
+bool addJsonReviewField(Review* review, const char* name, JsonVariantConst value) {
+    const size_t n = measureJson(value);
+    if (n == 0 || n >= REVIEW_FIELD_VALUE_LEN) {
+        char w[80];
+        snprintf(w, sizeof(w), "%s too large to review", name);
+        setReviewError(review, Status::Invalid, w);
+        return false;
+    }
+    char text[REVIEW_FIELD_VALUE_LEN];
+    serializeJson(value, text, sizeof(text));
+    return addReviewField(review, name, text);
+}
+
+bool validatePathSet(JsonVariantConst v, Review* review) {
+    if (!v.is<JsonArrayConst>()) {
+        setReviewError(review, Status::Invalid, "Invalid Paths");
+        return false;
+    }
+    static const char* const allowedStep[] = {"account", "currency", "issuer"};
+    for (JsonVariantConst pv : v.as<JsonArrayConst>()) {
+        if (!pv.is<JsonArrayConst>()) {
+            setReviewError(review, Status::Invalid, "Invalid Paths");
+            return false;
+        }
+        for (JsonVariantConst sv : pv.as<JsonArrayConst>()) {
+            if (!sv.is<JsonObjectConst>()) {
+                setReviewError(review, Status::Invalid, "Invalid Paths");
+                return false;
+            }
+            if (!onlyAllowedNestedFields(sv.as<JsonObjectConst>(), allowedStep,
+                                         sizeof(allowedStep) / sizeof(allowedStep[0]), review,
+                                         "Paths")) {
+                return false;
+            }
+        }
+    }
+    static Bytes probe;
+    probe.len = 0;
+    if (!putPathSet(probe, v)) {
+        setReviewError(review, Status::Invalid, "Invalid Paths");
+        return false;
+    }
+    return true;
+}
+
+void hashPayload(const char* payload, uint8_t out[32]) {
+    crypto::sha256(reinterpret_cast<const uint8_t*>(payload), strlen(payload), out);
+}
+
+bool reviewedPayloadMatches(const char* payload) {
+    if (!payload || !g_reviewedReady) return false;
+    uint8_t hash[32];
+    hashPayload(payload, hash);
+    const bool ok = memcmp(hash, g_reviewedPayloadHash, sizeof(hash)) == 0;
+    memset(hash, 0, sizeof(hash));
+    return ok;
 }
 
 // Reject any field not in the per-type allowlist so the device never silently
@@ -551,10 +844,15 @@ bool reviewJson(JsonObject tx, Review* review) {
         setReviewError(review, Status::Invalid, "Missing Fee/Sequence/LastLedgerSequence");
         return false;
     }
+    if (!validateXrpDrops(tx["Fee"] | "", review, "Fee")) return false;
     strncpy(review->fee, tx["Fee"] | "", sizeof(review->fee) - 1);
     review->sequence = readU32(tx["Sequence"]);
     review->lastLedger = readU32(tx["LastLedgerSequence"]);
     review->highFee = strtoul(review->fee, nullptr, 10) > HIGH_FEE_DROPS;
+    if (!tx["Flags"].isNull() && !tx["Flags"].is<uint32_t>()) {
+        setReviewError(review, Status::Invalid, "Invalid Flags");
+        return false;
+    }
     if (tx["Flags"].is<uint32_t>()) {
         review->flags = readU32(tx["Flags"]);
         review->hasFlags = true;
@@ -567,6 +865,28 @@ bool reviewJson(JsonObject tx, Review* review) {
         review->sourceTag = readU32(tx["SourceTag"]);
         review->hasSourceTag = true;
     }
+    const char* signerPubKey = wallet::publicKeyHex();
+    if (!signerPubKey[0]) {
+        setReviewError(review, Status::Invalid, "Signer public key unavailable");
+        return false;
+    }
+    if (!addReviewField(review, "TransactionType", type) ||
+        !addReviewField(review, "Account", account) ||
+        !addReviewFieldFmt(review, "Fee", "%s drops", review->fee) ||
+        !addReviewFieldFmt(review, "Sequence", "%u", static_cast<unsigned>(review->sequence)) ||
+        !addReviewFieldFmt(review, "LastLedgerSequence", "%u",
+                           static_cast<unsigned>(review->lastLedger)) ||
+        !addReviewField(review, "SigningPubKey", signerPubKey)) {
+        return false;
+    }
+    if (review->hasFlags &&
+        !addReviewFieldFmt(review, "Flags", "0x%08X", static_cast<unsigned>(review->flags))) {
+        return false;
+    }
+    if (review->hasSourceTag &&
+        !addReviewFieldFmt(review, "SourceTag", "%u", static_cast<unsigned>(review->sourceTag))) {
+        return false;
+    }
 
     if (strcmp(type, "Payment") == 0) {
         static const char* const allowed[] = {
@@ -575,38 +895,56 @@ bool reviewJson(JsonObject tx, Review* review) {
             "SendMax",         "DeliverMin", "Paths"};
         if (!onlyAllowedFields(tx, allowed, sizeof(allowed) / sizeof(allowed[0]), review))
             return false;
-        const bool amtXrp = tx["Amount"].is<const char*>();
+        if (!validateAmountValue(tx["Amount"], review, "Amount")) return false;
         const bool amtIou = tx["Amount"].is<JsonObject>();
-        if (!amtXrp && !amtIou) {
-            setReviewError(review, Status::Invalid, "Invalid Amount");
-            return false;
-        }
         if (!tx["Destination"].is<const char*>()) {
             setReviewError(review, Status::Invalid, "Missing Destination");
             return false;
         }
-        if (!tx["SendMax"].isNull() && !tx["SendMax"].is<const char*>() &&
-            !tx["SendMax"].is<JsonObject>()) {
-            setReviewError(review, Status::Invalid, "Invalid SendMax");
+        uint8_t destProbe[20];
+        if (!wallet::accountIdFromAddress(tx["Destination"] | "", destProbe)) {
+            setReviewError(review, Status::Invalid, "Invalid Destination");
             return false;
         }
-        if (!tx["DeliverMin"].isNull() && !tx["DeliverMin"].is<const char*>() &&
-            !tx["DeliverMin"].is<JsonObject>()) {
-            setReviewError(review, Status::Invalid, "Invalid DeliverMin");
+        if (!validateOptionalU32(tx, "DestinationTag", review)) return false;
+        if (!tx["SendMax"].isNull() && !validateAmountValue(tx["SendMax"], review, "SendMax"))
             return false;
-        }
-        if (!tx["Paths"].isNull() && !tx["Paths"].is<JsonArray>()) {
-            setReviewError(review, Status::Invalid, "Invalid Paths");
+        if (!tx["DeliverMin"].isNull() &&
+            !validateAmountValue(tx["DeliverMin"], review, "DeliverMin"))
             return false;
-        }
-        char amt[40];
+        if (!tx["Paths"].isNull() && !validatePathSet(tx["Paths"], review)) return false;
+        char amt[96];
         formatAmount(tx["Amount"], amt, sizeof(amt));
+        if (!addReviewField(review, "Amount", amt) ||
+            !addReviewField(review, "Destination", tx["Destination"] | "")) {
+            return false;
+        }
+        if (tx["DestinationTag"].is<uint32_t>()) {
+            review->destinationTag = readU32(tx["DestinationTag"]);
+            review->hasDestinationTag = true;
+            if (!addReviewFieldFmt(review, "DestinationTag", "%u",
+                                   static_cast<unsigned>(review->destinationTag))) {
+                return false;
+            }
+        }
+        if (!tx["SendMax"].isNull()) {
+            char send[96];
+            formatAmount(tx["SendMax"], send, sizeof(send));
+            if (!addReviewField(review, "SendMax", send)) return false;
+        }
+        if (!tx["DeliverMin"].isNull()) {
+            char deliver[96];
+            formatAmount(tx["DeliverMin"], deliver, sizeof(deliver));
+            if (!addReviewField(review, "DeliverMin", deliver)) return false;
+        }
+        if (!tx["Paths"].isNull() && !addJsonReviewField(review, "Paths", tx["Paths"]))
+            return false;
         const bool selfSwap = strcmp(tx["Destination"] | "", account) == 0;
         const bool isSwap = selfSwap || amtIou || !tx["SendMax"].isNull();
         if (isSwap) {
             snprintf(review->primary, sizeof(review->primary), "Swap -> %s", amt);
             if (!tx["SendMax"].isNull()) {
-                char send[40];
+                char send[96];
                 formatAmount(tx["SendMax"], send, sizeof(send));
                 snprintf(review->secondary, sizeof(review->secondary), "Max %s", send);
             } else {
@@ -620,10 +958,6 @@ bool reviewJson(JsonObject tx, Review* review) {
             wallet::shortenAddress(tx["Destination"] | "", shortDest, sizeof(shortDest));
             snprintf(review->secondary, sizeof(review->secondary), "To %s", shortDest);
         }
-        if (tx["DestinationTag"].is<uint32_t>()) {
-            review->destinationTag = readU32(tx["DestinationTag"]);
-            review->hasDestinationTag = true;
-        }
     } else if (strcmp(type, "OfferCreate") == 0) {
         static const char* const allowed[] = {"TransactionType", "Account",   "Fee",
                                               "Sequence",        "LastLedgerSequence",
@@ -631,15 +965,29 @@ bool reviewJson(JsonObject tx, Review* review) {
                                               "TakerGets",       "Expiration", "OfferSequence"};
         if (!onlyAllowedFields(tx, allowed, sizeof(allowed) / sizeof(allowed[0]), review))
             return false;
-        const bool paysOk = tx["TakerPays"].is<const char*>() || tx["TakerPays"].is<JsonObject>();
-        const bool getsOk = tx["TakerGets"].is<const char*>() || tx["TakerGets"].is<JsonObject>();
-        if (!paysOk || !getsOk) {
-            setReviewError(review, Status::Invalid, "Invalid TakerPays/TakerGets");
+        if (!validateAmountValue(tx["TakerPays"], review, "TakerPays") ||
+            !validateAmountValue(tx["TakerGets"], review, "TakerGets") ||
+            !validateOptionalU32(tx, "Expiration", review) ||
+            !validateOptionalU32(tx, "OfferSequence", review)) {
             return false;
         }
-        char pays[40], gets[40];
+        char pays[96], gets[96];
         formatAmount(tx["TakerPays"], pays, sizeof(pays));
         formatAmount(tx["TakerGets"], gets, sizeof(gets));
+        if (!addReviewField(review, "TakerPays", pays) ||
+            !addReviewField(review, "TakerGets", gets)) {
+            return false;
+        }
+        if (tx["Expiration"].is<uint32_t>() &&
+            !addReviewFieldFmt(review, "Expiration", "%u",
+                               static_cast<unsigned>(readU32(tx["Expiration"])))) {
+            return false;
+        }
+        if (tx["OfferSequence"].is<uint32_t>() &&
+            !addReviewFieldFmt(review, "OfferSequence", "%u",
+                               static_cast<unsigned>(readU32(tx["OfferSequence"])))) {
+            return false;
+        }
         snprintf(review->primary, sizeof(review->primary), "Buy %s", pays);
         snprintf(review->secondary, sizeof(review->secondary), "Pay %s", gets);
     } else if (strcmp(type, "AMMDeposit") == 0 || strcmp(type, "AMMWithdraw") == 0) {
@@ -656,8 +1004,8 @@ bool reviewJson(JsonObject tx, Review* review) {
         const size_t allowedN = deposit ? sizeof(allowedDep) / sizeof(allowedDep[0])
                                         : sizeof(allowedWit) / sizeof(allowedWit[0]);
         if (!onlyAllowedFields(tx, allowed, allowedN, review)) return false;
-        if (!tx["Asset"].is<JsonObject>() || !tx["Asset2"].is<JsonObject>()) {
-            setReviewError(review, Status::Invalid, "Missing Asset/Asset2");
+        if (!validateIssueValue(tx["Asset"], review, "Asset") ||
+            !validateIssueValue(tx["Asset2"], review, "Asset2")) {
             return false;
         }
         const char* lpField = deposit ? "LPTokenOut" : "LPTokenIn";
@@ -666,18 +1014,48 @@ bool reviewJson(JsonObject tx, Review* review) {
             setReviewError(review, Status::Invalid, "No deposit/withdraw amount");
             return false;
         }
-        char a1[20], a2[20];
+        if (!tx["Amount"].isNull() && !validateAmountValue(tx["Amount"], review, "Amount"))
+            return false;
+        if (!tx["Amount2"].isNull() && !validateAmountValue(tx["Amount2"], review, "Amount2"))
+            return false;
+        if (!tx["EPrice"].isNull() && !validateAmountValue(tx["EPrice"], review, "EPrice"))
+            return false;
+        if (!tx[lpField].isNull() && !validateAmountValue(tx[lpField], review, lpField))
+            return false;
+        char a1[96], a2[96];
         formatIssue(tx["Asset"], a1, sizeof(a1));
         formatIssue(tx["Asset2"], a2, sizeof(a2));
+        if (!addReviewField(review, "Asset", a1) || !addReviewField(review, "Asset2", a2))
+            return false;
+        if (!tx["Amount"].isNull()) {
+            char v[96];
+            formatAmount(tx["Amount"], v, sizeof(v));
+            if (!addReviewField(review, "Amount", v)) return false;
+        }
+        if (!tx["Amount2"].isNull()) {
+            char v[96];
+            formatAmount(tx["Amount2"], v, sizeof(v));
+            if (!addReviewField(review, "Amount2", v)) return false;
+        }
+        if (!tx["EPrice"].isNull()) {
+            char v[96];
+            formatAmount(tx["EPrice"], v, sizeof(v));
+            if (!addReviewField(review, "EPrice", v)) return false;
+        }
+        if (!tx[lpField].isNull()) {
+            char v[96];
+            formatAmount(tx[lpField], v, sizeof(v));
+            if (!addReviewField(review, lpField, v)) return false;
+        }
         snprintf(review->primary, sizeof(review->primary), "%s %s/%s",
                  deposit ? "Add LP" : "Remove LP", a1, a2);
         if (!tx["Amount"].isNull() && !tx["Amount2"].isNull()) {
-            char x[40], y[40];
+            char x[96], y[96];
             formatAmount(tx["Amount"], x, sizeof(x));
             formatAmount(tx["Amount2"], y, sizeof(y));
             snprintf(review->secondary, sizeof(review->secondary), "%s + %s", x, y);
         } else if (!tx[lpField].isNull()) {
-            char lp[40];
+            char lp[96];
             formatAmount(tx[lpField], lp, sizeof(lp));
             snprintf(review->secondary, sizeof(review->secondary), "%s LP", lp);
         } else if (!tx["Amount"].isNull()) {
@@ -691,18 +1069,11 @@ bool reviewJson(JsonObject tx, Review* review) {
                                               "Flags",           "SourceTag", "LimitAmount"};
         if (!onlyAllowedFields(tx, allowed, sizeof(allowed) / sizeof(allowed[0]), review))
             return false;
+        if (!validateAmountValue(tx["LimitAmount"], review, "LimitAmount")) return false;
         JsonObject limit = tx["LimitAmount"].as<JsonObject>();
-        if (limit.isNull() || !limit["currency"].is<const char*>() ||
-            !limit["issuer"].is<const char*>() || !limit["value"].is<const char*>()) {
-            setReviewError(review, Status::Invalid, "Invalid LimitAmount");
-            return false;
-        }
-        uint8_t probe[20];
-        if (!fillCurrency(limit["currency"] | "", probe) ||
-            !wallet::accountIdFromAddress(limit["issuer"] | "", probe)) {
-            setReviewError(review, Status::Invalid, "Bad currency/issuer");
-            return false;
-        }
+        char limitText[96];
+        formatAmount(tx["LimitAmount"], limitText, sizeof(limitText));
+        if (!addReviewField(review, "LimitAmount", limitText)) return false;
         snprintf(review->primary, sizeof(review->primary), "Limit %s %s", limit["value"] | "",
                  limit["currency"] | "");
         char shortIss[32];
@@ -718,6 +1089,10 @@ bool reviewJson(JsonObject tx, Review* review) {
             setReviewError(review, Status::Invalid, "Missing OfferSequence");
             return false;
         }
+        if (!addReviewFieldFmt(review, "OfferSequence", "%u",
+                               static_cast<unsigned>(readU32(tx["OfferSequence"])))) {
+            return false;
+        }
         strncpy(review->primary, "Cancel offer", sizeof(review->primary) - 1);
         snprintf(review->secondary, sizeof(review->secondary), "Offer #%u",
                  static_cast<unsigned>(readU32(tx["OfferSequence"])));
@@ -727,9 +1102,23 @@ bool reviewJson(JsonObject tx, Review* review) {
                                               "SourceTag",       "SetFlag", "ClearFlag"};
         if (!onlyAllowedFields(tx, allowed, sizeof(allowed) / sizeof(allowed[0]), review))
             return false;
+        if (!validateOptionalU32(tx, "SetFlag", review) ||
+            !validateOptionalU32(tx, "ClearFlag", review)) {
+            return false;
+        }
         strncpy(review->primary, "Account settings", sizeof(review->primary) - 1);
         const bool hasSet = tx["SetFlag"].is<uint32_t>();
         const bool hasClear = tx["ClearFlag"].is<uint32_t>();
+        if (hasSet &&
+            !addReviewFieldFmt(review, "SetFlag", "%u",
+                               static_cast<unsigned>(readU32(tx["SetFlag"])))) {
+            return false;
+        }
+        if (hasClear &&
+            !addReviewFieldFmt(review, "ClearFlag", "%u",
+                               static_cast<unsigned>(readU32(tx["ClearFlag"])))) {
+            return false;
+        }
         if (hasSet && hasClear) {
             snprintf(review->secondary, sizeof(review->secondary), "Set %u / Clear %u",
                      static_cast<unsigned>(readU32(tx["SetFlag"])),
@@ -772,8 +1161,8 @@ const char* statusText(Status status) {
 }
 
 bool parseAndReview(const char* payload, Review* review) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, payload);
+    clearReviewedCache();
+    DeserializationError err = deserializeJson(g_reviewedDoc, payload);
     if (err) {
         memset(review, 0, sizeof(*review));
         char w[80];
@@ -781,31 +1170,32 @@ bool parseAndReview(const char* payload, Review* review) {
         setReviewError(review, Status::Invalid, w);
         return false;
     }
-    const char* network = doc["network"] | "mainnet";
+    const char* network = g_reviewedDoc["network"] | "mainnet";
     if (strcmp(network, "mainnet") != 0) {
         memset(review, 0, sizeof(*review));
         setReviewError(review, Status::Invalid, "Only mainnet payloads accepted");
         return false;
     }
-    JsonObject tx = txObject(doc);
-    return reviewJson(tx, review);
+    JsonObject tx = txObject(g_reviewedDoc);
+    if (!reviewJson(tx, review)) return false;
+    hashPayload(payload, g_reviewedPayloadHash);
+    g_reviewedReview = *review;
+    g_reviewedReady = review->status == Status::Ready;
+    return g_reviewedReady;
 }
 
 bool signReviewedPayload(const char* payload, SignedTx* out) {
     memset(out, 0, sizeof(*out));
-    static Review review;
-    static JsonDocument doc;
-    doc.clear();
-    if (deserializeJson(doc, payload)) {
-        strncpy(out->error, "JSON parse failed", sizeof(out->error) - 1);
+    if (!reviewedPayloadMatches(payload)) {
+        strncpy(out->error, "Payload review required", sizeof(out->error) - 1);
         return false;
     }
-    JsonObject tx = txObject(doc);
-    memset(&review, 0, sizeof(review));
-    if (!reviewJson(tx, &review)) {
-        strncpy(out->error, review.warning, sizeof(out->error) - 1);
+    if (!wallet::isUnlocked() || strcmp(g_reviewedReview.account, wallet::address()) != 0) {
+        strncpy(out->error, "Wallet changed after review", sizeof(out->error) - 1);
         return false;
     }
+    JsonObject tx = txObject(g_reviewedDoc);
+    const Review& review = g_reviewedReview;
 
     // Work buffers in BSS — keep ~6 KB off the loop-task stack during ECDSA.
     static Bytes signing;
@@ -816,7 +1206,7 @@ bool signReviewedPayload(const char* payload, SignedTx* out) {
     hashInput.len = 0;
 
     append(signing, STX_PREFIX, sizeof(STX_PREFIX));
-    if (!serialize(review.type, signing, tx, false, nullptr, 0)) {
+    if (!serialize(review.type, signing, tx, review, false, nullptr, 0)) {
         strncpy(out->error, "Signing serialization failed", sizeof(out->error) - 1);
         return false;
     }
@@ -828,7 +1218,7 @@ bool signReviewedPayload(const char* payload, SignedTx* out) {
         return false;
     }
 
-    if (!serialize(review.type, signedBlob, tx, true, sig, sigLen)) {
+    if (!serialize(review.type, signedBlob, tx, review, true, sig, sigLen)) {
         strncpy(out->error, "Signed serialization failed", sizeof(out->error) - 1);
         return false;
     }
@@ -845,6 +1235,7 @@ bool signReviewedPayload(const char* payload, SignedTx* out) {
     response["tx_blob"] = out->txBlob;
     response["tx_hash"] = out->txHash;
     serializeJson(response, out->json, sizeof(out->json));
+    clearReviewedCache();
     return true;
 }
 

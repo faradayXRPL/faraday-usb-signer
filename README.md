@@ -1,4 +1,4 @@
-# FARADAY USB Signer — Firmware v0.1
+# FARADAY USB Signer - Firmware v0.2
 
 Offline XRPL transaction signer for **ESP32-S3 touch LCD** hardware
 (480×320, USB-CDC).
@@ -12,7 +12,9 @@ display, signed locally after a physical *hold-to-sign*, and returned as a signe
 | Network | XRPL **mainnet** only (other networks are rejected) |
 | Radios | WiFi / BLE are never started |
 | I/O | Display, touch, USB-CDC |
-| Signing | Sign-what-you-see — fields are re-derived on-device; allowlisted types only |
+| Signing | Sign-what-you-see: one validated transaction object drives review and signing |
+| Nonces | Hedged RFC6979 ECDSA nonces: key+message deterministic base mixed with fresh entropy |
+| Storage | Production profile enables Secure Boot v2 + Flash Encryption; NVS is marked encrypted |
 
 Part of the [Faraday](https://github.com/faradayXRPL) air-gapped signing stack.
 Use with the desktop companion
@@ -38,8 +40,73 @@ pio device monitor         # optional: serial log
 PlatformIO env: `esp32-s3-touch-lcd-3p5c` (`esp32-s3-devkitc-1` profile).
 
 > This folder also lives in the monorepo
-> [faraday-v0.1](https://github.com/faradayXRPL/faraday-v0.1) at
-> `firmware/faraday-usb-signer`.
+> [faraday-v0.2](https://github.com/faradayXRPL) at
+> `firmware/faraday-usb-signer-v0.2`.
+
+## v0.2 security changes
+
+- JSON is parsed and validated once into the current reviewed transaction. The
+  hold-to-sign path signs only that cached reviewed object, guarded by a payload
+  SHA-256 match, so the display path and signing path cannot drift through a
+  second deserialize.
+- The review screen lists every user-supplied field that the serializer can
+  write. Serialization refuses to emit a field unless it is present in the
+  review field set.
+- Nested amount/asset objects are allowlisted too. Optional fields with the
+  wrong type are rejected instead of silently ignored.
+- `Paths` is accepted only when its canonical JSON value fits fully on the
+  device review field list; oversized path sets are rejected instead of being
+  signed unseen.
+- ECDSA signing uses hedged RFC6979 nonces. The nonce DRBG is seeded from the
+  private key and message hash, with fresh device entropy mixed in before each
+  signature.
+- Wallet seed, salt, GCM nonce, and mbedTLS blinding RNG use an explicit entropy
+  bootstrap based on `bootloader_random_enable()` plus hashed hardware RNG and
+  timing jitter samples.
+
+## Production security build
+
+`sdkconfig.release.defaults` is the production profile. It enables Secure Boot
+v2, Flash Encryption in release mode, AES-XTS-256, app flash-encryption checks,
+and disables insecure ROM download mode. The local partition table
+`partitions_faraday_secure.csv` marks the NVS partition as `encrypted`, because
+the sealed seed blob lives in NVS.
+
+Build the normal development image:
+
+```bash
+pio run -e esp32-s3-touch-lcd-3p5c
+```
+
+Build the production security image:
+
+```bash
+pio run -e esp32-s3-touch-lcd-3p5c-release
+```
+
+Production flashing is a manufacturing step, not a casual upload. Generate and
+store the RSA-3072 Secure Boot private key outside the repository, keep
+`secure_boot_signing_key.pem` out of source control, follow the ESP-IDF Secure
+Boot v2 and Flash Encryption first-boot flow, and verify on serial logs that
+Secure Boot and Flash Encryption are enabled before any device leaves the
+factory. First boot burns irreversible eFuses.
+
+## Entropy verification
+
+Before public release, verify entropy on real air-gapped ESP32-S3 hardware:
+
+- Cold power-cycle at least 100 devices or 100 boots of the same device.
+- Capture the first diagnostic seed/RNG sample before wallet creation in a
+  non-production diagnostic build only.
+- Check for repeats and cross-boot correlation.
+- Run NIST SP 800-90B min-entropy estimation on raw collected source samples.
+- Run an SP 800-22 smoke subset on conditioned output: monobit, runs, serial.
+
+The helper `scripts/entropy_cold_boot_check.py` collects one disabled-by-default
+`ENTROPY_DIAG` sample per manual cold boot and flags exact duplicates in the CSV.
+
+Do not enable entropy diagnostics in production builds and do not publish raw
+seed material from a real wallet.
 
 ## USB protocol (115200 baud, line based)
 

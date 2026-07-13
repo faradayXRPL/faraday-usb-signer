@@ -14,6 +14,7 @@ void setup() {
     delay(300);
     Serial.printf("[boot] reset_reason=%d\n", static_cast<int>(esp_reset_reason()));
 
+    wallet::beginEntropy();
     display::begin();
 
     if (esp_reset_reason() == ESP_RST_POWERON) {

@@ -5,6 +5,7 @@
 
 namespace wallet {
 
+void beginEntropy();
 void begin();
 
 // Storage / lock state.
@@ -33,5 +34,6 @@ bool exportFamilySeed(char* out, size_t outSize);
 bool signSha512Half(const uint8_t* data, size_t len, uint8_t* der, size_t* derLen);
 bool accountIdFromAddress(const char* address, uint8_t out[20]);
 void shortenAddress(const char* full, char* out, size_t outSize);
+bool diagnosticEntropySample(char* outHex, size_t outSize);
 
 }  // namespace wallet

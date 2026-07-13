@@ -33,3 +33,11 @@ We aim to acknowledge within **72 hours**.
 - Never commit device seeds, PINs, or NVS dumps
 - `.pio/` and build artifacts stay local (see `.gitignore`)
 - Verify reproducible builds from a clean checkout before trusting a binary
+
+## v0.2 release hardening
+
+- Production devices must be built with `esp32-s3-touch-lcd-3p5c-release`.
+- The release profile enables Secure Boot v2 and Flash Encryption release mode.
+- The NVS partition is marked `encrypted` in `partitions_faraday_secure.csv`.
+- Keep `secure_boot_signing_key.pem` outside the repository and manufacturing logs.
+- Do not ship firmware with `cfg::ENTROPY_DIAGNOSTICS=true`.

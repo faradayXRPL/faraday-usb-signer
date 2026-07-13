@@ -2,8 +2,10 @@
 
 #include <Arduino.h>
 #include <Preferences.h>
+#include <bootloader_random.h>
 #include <esp_mac.h>
 #include <esp_system.h>
+#include <esp_timer.h>
 #include <mbedtls/asn1write.h>
 #include <mbedtls/ecdsa.h>
 #include <mbedtls/ecp.h>
@@ -40,6 +42,7 @@ Preferences prefs;
 bool g_hasWallet = false;  // a sealed blob + salt exist in NVS
 bool g_unlocked = false;   // seed is decrypted in RAM (signing enabled)
 int g_fails = 0;           // consecutive wrong-PIN attempts
+bool g_entropyBootstrapped = false;
 uint8_t g_salt[SALT_LEN] = {};
 // The 16-byte seed is held decrypted in RAM ONLY while unlocked, and is
 // zeroized on lock()/clearWallet(). At rest it is sealed with AES-256-GCM under
@@ -49,9 +52,91 @@ uint8_t g_seed[SEED_LEN] = {};
 char g_address[40] = "NO WALLET";
 char g_publicKeyHex[68] = "";
 
+void beginEntropyInternal() {
+    if (g_entropyBootstrapped) return;
+    bootloader_random_enable();
+    for (int i = 0; i < 32; ++i) {
+        (void)esp_random();
+        delayMicroseconds(20);
+    }
+    g_entropyBootstrapped = true;
+}
+
+bool sha256Update(mbedtls_sha256_context* ctx, const void* data, size_t len) {
+    return len == 0 ||
+           mbedtls_sha256_update_ret(ctx, static_cast<const unsigned char*>(data), len) == 0;
+}
+
+bool fillEntropy(uint8_t* out, size_t len, const char* label) {
+    if (!out && len) return false;
+    beginEntropyInternal();
+
+    uint8_t prev[32] = {};
+    size_t off = 0;
+    uint32_t counter = 0;
+    while (off < len) {
+        uint8_t hw[64];
+        esp_fill_random(hw, sizeof(hw));
+
+        mbedtls_sha256_context ctx;
+        mbedtls_sha256_init(&ctx);
+        bool ok = mbedtls_sha256_starts_ret(&ctx, 0) == 0 &&
+                  sha256Update(&ctx, label, strlen(label)) &&
+                  sha256Update(&ctx, &counter, sizeof(counter)) &&
+                  sha256Update(&ctx, prev, sizeof(prev)) &&
+                  sha256Update(&ctx, hw, sizeof(hw));
+        for (int i = 0; ok && i < 24; ++i) {
+            const uint32_t rnd = esp_random();
+            const int64_t us = esp_timer_get_time();
+            const uint32_t arduinoUs = micros();
+            ok = sha256Update(&ctx, &rnd, sizeof(rnd)) &&
+                 sha256Update(&ctx, &us, sizeof(us)) &&
+                 sha256Update(&ctx, &arduinoUs, sizeof(arduinoUs));
+            delayMicroseconds((rnd & 0x03U) + 1U);
+        }
+        ok = ok && mbedtls_sha256_finish_ret(&ctx, prev) == 0;
+        mbedtls_sha256_free(&ctx);
+        memset(hw, 0, sizeof(hw));
+        if (!ok) {
+            memset(out, 0, len);
+            memset(prev, 0, sizeof(prev));
+            return false;
+        }
+
+        const size_t n = (len - off) < sizeof(prev) ? (len - off) : sizeof(prev);
+        memcpy(out + off, prev, n);
+        off += n;
+        ++counter;
+    }
+    memset(prev, 0, sizeof(prev));
+    return true;
+}
+
 int espRng(void*, unsigned char* out, size_t len) {
-    esp_fill_random(out, len);
-    return 0;
+    return fillEntropy(out, len, "mbedtls-rng") ? 0 : -1;
+}
+
+bool hmacSha256(const uint8_t* key, size_t keyLen, const uint8_t* data, size_t len,
+                uint8_t out[32]) {
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    return info != nullptr && mbedtls_md_hmac(info, key, keyLen, data, len, out) == 0;
+}
+
+bool hmacSha256Chunks(const uint8_t* key, size_t keyLen, const uint8_t* a, size_t aLen,
+                      const uint8_t* b, size_t bLen, const uint8_t* c, size_t cLen,
+                      const uint8_t* d, size_t dLen, uint8_t out[32]) {
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    mbedtls_md_context_t md;
+    mbedtls_md_init(&md);
+    bool ok = info != nullptr && mbedtls_md_setup(&md, info, 1) == 0 &&
+              mbedtls_md_hmac_starts(&md, key, keyLen) == 0;
+    if (ok && aLen) ok = mbedtls_md_hmac_update(&md, a, aLen) == 0;
+    if (ok && bLen) ok = mbedtls_md_hmac_update(&md, b, bLen) == 0;
+    if (ok && cLen) ok = mbedtls_md_hmac_update(&md, c, cLen) == 0;
+    if (ok && dLen) ok = mbedtls_md_hmac_update(&md, d, dLen) == 0;
+    ok = ok && mbedtls_md_hmac_finish(&md, out) == 0;
+    mbedtls_md_free(&md);
+    return ok;
 }
 
 bool derEncodeEcdsa(const mbedtls_mpi* r, const mbedtls_mpi* s, uint8_t* der, size_t* derLen) {
@@ -84,17 +169,91 @@ bool mpiFromHash(mbedtls_mpi* e, const mbedtls_ecp_group* grp, const uint8_t has
     return mbedtls_mpi_read_binary(e, hash, 32) == 0 && mbedtls_mpi_mod_mpi(e, e, &grp->N) == 0;
 }
 
-bool randomScalarNonZero(mbedtls_mpi* k, const mbedtls_ecp_group* grp) {
-    uint8_t buf[32];
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        esp_fill_random(buf, sizeof(buf));
-        if (mbedtls_mpi_read_binary(k, buf, sizeof(buf)) != 0) continue;
-        if (mbedtls_mpi_cmp_mpi(k, &grp->N) >= 0) {
-            if (mbedtls_mpi_mod_mpi(k, k, &grp->N) != 0) continue;
-        }
-        if (mbedtls_mpi_cmp_int(k, 0) == 0) continue;
-        return true;
+bool mpiToFixed32(const mbedtls_mpi* value, uint8_t out[32]) {
+    return mbedtls_mpi_write_binary(value, out, 32) == 0;
+}
+
+bool bitsToOctets(const mbedtls_ecp_group* grp, const uint8_t hash[32], uint8_t out[32]) {
+    mbedtls_mpi z;
+    mbedtls_mpi_init(&z);
+    const bool ok = mbedtls_mpi_read_binary(&z, hash, 32) == 0 &&
+                    mbedtls_mpi_mod_mpi(&z, &z, &grp->N) == 0 && mpiToFixed32(&z, out);
+    mbedtls_mpi_free(&z);
+    return ok;
+}
+
+bool hmacInto(uint8_t K[32], const uint8_t* data, size_t len, uint8_t out[32]) {
+    uint8_t tmp[32];
+    const bool ok = hmacSha256(K, 32, data, len, tmp);
+    if (ok) memcpy(out, tmp, sizeof(tmp));
+    memset(tmp, 0, sizeof(tmp));
+    return ok;
+}
+
+bool rfc6979Update(uint8_t K[32], uint8_t V[32], uint8_t sep, const uint8_t* seed,
+                   size_t seedLen) {
+    uint8_t nextK[32];
+    uint8_t nextV[32];
+    const bool okK = hmacSha256Chunks(K, 32, V, 32, &sep, 1, seed, seedLen, nullptr, 0, nextK);
+    if (!okK) {
+        memset(nextK, 0, sizeof(nextK));
+        return false;
     }
+    memcpy(K, nextK, sizeof(nextK));
+    const bool okV = hmacInto(K, V, 32, nextV);
+    if (okV) memcpy(V, nextV, sizeof(nextV));
+    memset(nextK, 0, sizeof(nextK));
+    memset(nextV, 0, sizeof(nextV));
+    return okV;
+}
+
+bool hedgedRfc6979ScalarNonZero(mbedtls_mpi* k, const mbedtls_ecp_group* grp,
+                                const uint8_t priv[32], const uint8_t hash[32]) {
+    uint8_t h1[32];
+    uint8_t hedge[32];
+    uint8_t seed[96];
+    uint8_t K[32];
+    uint8_t V[32];
+    uint8_t candidate[32];
+    memset(K, 0x00, sizeof(K));
+    memset(V, 0x01, sizeof(V));
+
+    bool ok = bitsToOctets(grp, hash, h1) && fillEntropy(hedge, sizeof(hedge), "ecdsa-k-hedge");
+    if (ok) {
+        memcpy(seed, priv, 32);
+        memcpy(seed + 32, h1, 32);
+        memcpy(seed + 64, hedge, 32);
+        ok = rfc6979Update(K, V, 0x00, seed, sizeof(seed)) &&
+             rfc6979Update(K, V, 0x01, seed, sizeof(seed));
+    }
+
+    for (int attempt = 0; ok && attempt < 64; ++attempt) {
+        uint8_t nextV[32];
+        ok = hmacInto(K, V, 32, nextV);
+        if (!ok) break;
+        memcpy(V, nextV, sizeof(nextV));
+        memcpy(candidate, V, sizeof(candidate));
+        memset(nextV, 0, sizeof(nextV));
+
+        if (mbedtls_mpi_read_binary(k, candidate, sizeof(candidate)) == 0 &&
+            mbedtls_mpi_cmp_int(k, 0) > 0 && mbedtls_mpi_cmp_mpi(k, &grp->N) < 0) {
+            memset(h1, 0, sizeof(h1));
+            memset(hedge, 0, sizeof(hedge));
+            memset(seed, 0, sizeof(seed));
+            memset(K, 0, sizeof(K));
+            memset(V, 0, sizeof(V));
+            memset(candidate, 0, sizeof(candidate));
+            return true;
+        }
+        ok = rfc6979Update(K, V, 0x00, nullptr, 0);
+    }
+
+    memset(h1, 0, sizeof(h1));
+    memset(hedge, 0, sizeof(hedge));
+    memset(seed, 0, sizeof(seed));
+    memset(K, 0, sizeof(K));
+    memset(V, 0, sizeof(V));
+    memset(candidate, 0, sizeof(candidate));
     return false;
 }
 
@@ -125,7 +284,7 @@ bool ecdsaSignDigest(mbedtls_ecp_group* grp, const uint8_t priv[32], const uint8
     if (ok) {
         ok = false;
         for (int attempt = 0; attempt < 64; ++attempt) {
-            if (!randomScalarNonZero(&k, grp)) continue;
+            if (!hedgedRfc6979ScalarNonZero(&k, grp, priv, hash)) continue;
             if (mbedtls_ecp_mul(grp, &rPoint, &k, &grp->G, espRng, nullptr) != 0) continue;
             if (mbedtls_mpi_mod_mpi(rOut, &rPoint.X, &grp->N) != 0) continue;
             if (mbedtls_mpi_cmp_int(rOut, 0) == 0) continue;
@@ -357,7 +516,7 @@ bool deriveStorageKey(const char* pin, const uint8_t salt[SALT_LEN], uint8_t out
 }
 
 bool gcmEncrypt(const uint8_t seed[SEED_LEN], const uint8_t key[32], uint8_t blob[BLOB_LEN]) {
-    esp_fill_random(blob, NONCE_LEN);
+    if (!fillEntropy(blob, NONCE_LEN, "seed-gcm-nonce")) return false;
     mbedtls_gcm_context gcm;
     mbedtls_gcm_init(&gcm);
     bool ok = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256) == 0 &&
@@ -520,6 +679,10 @@ bool signSha512Half(const uint8_t* data, size_t len, uint8_t* der, size_t* derLe
     return signSha512HalfImpl(data, len, der, derLen);
 }
 
+void beginEntropy() {
+    beginEntropyInternal();
+}
+
 void begin() {
     prefs.begin(PREF_NS, true);
     const bool haveBlob = prefs.getBytesLength(PREF_BLOB) == BLOB_LEN;
@@ -578,8 +741,10 @@ bool unlock(const char* pin) {
 }
 
 bool createWallet(const char* pin) {
-    esp_fill_random(g_salt, sizeof(g_salt));
-    esp_fill_random(g_seed, sizeof(g_seed));
+    if (!fillEntropy(g_salt, sizeof(g_salt), "wallet-salt") ||
+        !fillEntropy(g_seed, sizeof(g_seed), "wallet-seed")) {
+        return false;
+    }
     const bool ok = rebuildDerived() && sealSeed(pin);
     if (ok) {
         g_hasWallet = true;
@@ -594,7 +759,10 @@ bool createWallet(const char* pin) {
 bool importSeed(const char* seed, const char* pin) {
     uint8_t decoded[SEED_LEN];
     if (!base58CheckDecode(0x21, seed, decoded, sizeof(decoded))) return false;
-    esp_fill_random(g_salt, sizeof(g_salt));
+    if (!fillEntropy(g_salt, sizeof(g_salt), "wallet-import-salt")) {
+        memset(decoded, 0, sizeof(decoded));
+        return false;
+    }
     memcpy(g_seed, decoded, sizeof(g_seed));
     memset(decoded, 0, sizeof(decoded));
     const bool ok = rebuildDerived() && sealSeed(pin);
@@ -610,7 +778,7 @@ bool importSeed(const char* seed, const char* pin) {
 
 bool changePin(const char* newPin) {
     if (!g_unlocked) return false;
-    esp_fill_random(g_salt, sizeof(g_salt));  // fresh salt on every re-seal
+    if (!fillEntropy(g_salt, sizeof(g_salt), "wallet-pin-salt")) return false;
     return sealSeed(newPin);
 }
 
@@ -641,6 +809,15 @@ bool exportFamilySeed(char* out, size_t outSize) {
 
 bool accountIdFromAddress(const char* address, uint8_t out[20]) {
     return base58CheckDecode(0x00, address, out, 20);
+}
+
+bool diagnosticEntropySample(char* outHex, size_t outSize) {
+    if (!cfg::ENTROPY_DIAGNOSTICS || !outHex || outSize < 65) return false;
+    uint8_t sample[32];
+    const bool ok = fillEntropy(sample, sizeof(sample), "entropy-diagnostic");
+    if (ok) crypto::bytesToHex(sample, sizeof(sample), outHex, outSize);
+    memset(sample, 0, sizeof(sample));
+    return ok;
 }
 
 void shortenAddress(const char* full, char* out, size_t outSize) {

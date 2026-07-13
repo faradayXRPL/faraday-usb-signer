@@ -22,6 +22,7 @@ inline constexpr bool DISPLAY_COLOR_INVERT = true;
 inline constexpr int16_t DISPLAY_COL_OFFSET = 0;
 inline constexpr int16_t DISPLAY_ROW_OFFSET = 0;
 inline constexpr bool DIAGNOSTIC_BOOT_TEST = false;
+inline constexpr bool ENTROPY_DIAGNOSTICS = false;
 
 inline constexpr uint16_t LVGL_BUFFER_LINES = 40;
 
@@ -49,7 +50,7 @@ inline constexpr uint8_t DISPLAY_SPI_MODE = 0;
 inline constexpr size_t MAX_TX_JSON = 4096;
 
 inline constexpr char FW_NAME[] = "FARADAY";
-inline constexpr char FW_VERSION[] = "v0.1";
+inline constexpr char FW_VERSION[] = "v0.2";
 
 inline constexpr int PIN_MIN_LEN = 4;
 inline constexpr int PIN_MAX_LEN = 8;

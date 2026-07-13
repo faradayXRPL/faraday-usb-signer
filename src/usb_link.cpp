@@ -94,6 +94,17 @@ void handleLine(const char* line) {
         return;
     }
 
+    if (strcmp(line, "ENTROPY_DIAG") == 0) {
+        char sample[65];
+        if (wallet::diagnosticEntropySample(sample, sizeof(sample))) {
+            Serial.print("ENTROPY_DIAG ");
+            Serial.println(sample);
+        } else {
+            emitError("Entropy diagnostics disabled");
+        }
+        return;
+    }
+
     if (strcmp(line, "ADDRESS") == 0) {
         if (!wallet::hasWallet()) {
             Serial.println("ADDRESS none");
